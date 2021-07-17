@@ -98,7 +98,7 @@ etcd::Watcher::~Watcher()
 bool etcd::Watcher::Wait()
 {
   if (!cancelled.exchange(true)) {
-    if (task_.joinable()) {
+    if (task_.get_id() != std::this_thread::get_id() && task_.joinable()) {
       task_.join();
     }
   }
