@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <ratio>
 
@@ -11,6 +12,44 @@
 namespace etcdv3 {
 class AsyncLeaseKeepAliveAction;
 }
+
+namespace {
+// Calculate keepalive heartbeat interval based on TTL
+// Can be overridden by ETCD_KEEPALIVE_INTERVAL environment variable
+// Format: "ETCD_KEEPALIVE_INTERVAL=<seconds>" for fixed interval
+//         "ETCD_KEEPALIVE_RATIO=<percent>" for ratio-based (e.g., 33 for 1/3)
+// Default: 1/3 of TTL if not set
+int calculate_keepalive_ttl(int ttl) {
+  const char* interval_env = std::getenv("ETCD_KEEPALIVE_INTERVAL");
+  if (interval_env != nullptr) {
+    try {
+      int interval = std::stoi(interval_env);
+      return std::max(interval, 1);
+    } catch (...) {
+      std::cerr << "[warn] Invalid ETCD_KEEPALIVE_INTERVAL value: " << interval_env
+                << ", using default (1/3 TTL)" << std::endl;
+    }
+  }
+
+  const char* ratio_env = std::getenv("ETCD_KEEPALIVE_RATIO");
+  if (ratio_env != nullptr) {
+    try {
+      int ratio = std::stoi(ratio_env);
+      if (ratio > 0 && ratio <= 100) {
+        return std::max((ttl * ratio) / 100, 1);
+      }
+      std::cerr << "[warn] Invalid ETCD_KEEPALIVE_RATIO value: " << ratio_env
+                << " (must be 1-100), using default (1/3 TTL)" << std::endl;
+    } catch (...) {
+      std::cerr << "[warn] Invalid ETCD_KEEPALIVE_RATIO value: " << ratio_env
+                << ", using default (1/3 TTL)" << std::endl;
+    }
+  }
+
+  // Default: 1/3 of TTL
+  return std::max(ttl / 3, 1);
+}
+}  // namespace
 
 struct etcd::KeepAlive::EtcdServerStubs {
   std::unique_ptr<etcdserverpb::Lease::Stub> leaseServiceStub;
@@ -203,8 +242,10 @@ std::string etcd::KeepAlive::refresh() {
     if (!continue_next.load()) {
       return std::string{};
     }
-    // minimal resolution: 1 second
-    int keepalive_ttl = std::max(ttl - 1, 1);
+    // Calculate heartbeat interval as 1/3 of TTL to allow for 2 missed heartbeats
+    // before lease expiration, providing sufficient buffer for network latency and clock drift
+    // Can be overridden by ETCD_KEEPALIVE_INTERVAL or ETCD_KEEPALIVE_RATIO environment variables
+    int keepalive_ttl = calculate_keepalive_ttl(ttl);
     {
       std::unique_lock<std::mutex> lock(mutex_for_refresh_);
       if (cv_for_refresh_.wait_for(lock, std::chrono::seconds(keepalive_ttl)) ==
